@@ -1,0 +1,1 @@
+# webkit-shift-rot-armv7-proof

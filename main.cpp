@@ -59,73 +59,70 @@ camada::SMTExprRef computeExpected(const ShiftContext &ctx, ShiftOp op) {
 }
 
 camada::SMTExprRef computeActualRightShiftArithmetic(const ShiftContext &ctx) {
-  // m_jit.and32(TrustedImm32(63), rhsLo, shift);
+  // m_jit.and32(TrustedImm32(63), shiftReg, shift);
   auto shift_computed =
       ctx.solver->mkBVAnd(ctx.solver->mkBVFromDec(63, 32), ctx.rhsLo);
   ctx.solver->addConstraint(ctx.solver->mkEqual(ctx.shift, shift_computed));
 
-  // m_jit.urshift256(lhsLo, shift, resultLo);
+  // m_jit.urshiftUnchecked(lhsLo, shift, resultLo);
   auto resultLo1 = ctx.solver->mkSymbol("resultLo1", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
       resultLo1, ctx.solver->mkBVLshr(ctx.lhsLo, ctx.shift)));
 
-  // m_jit.move(TrustedImm32(32), tmp);
-  // m_jit.sub32(shift, tmp);  // tmp = tmp - shift
+  // m_jit.sub32(TrustedImm32(32), shift, tmp);
   auto tmp1 = ctx.solver->mkSymbol("tmp1", ctx.solver->mkBVSort(32));
-  ctx.solver->addConstraint(
-      ctx.solver->mkEqual(tmp1, ctx.solver->mkBVFromDec(32, 32)));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      tmp1, ctx.solver->mkBVSub(ctx.solver->mkBVFromDec(32, 32), ctx.shift)));
 
+  // m_jit.lshiftUnchecked(lhsHi, tmp, tmp);
+  // ARM uses bottom 8 bits; if >= 32, result is 0
+  auto tmp1_masked = ctx.solver->mkSymbol("tmp1_masked", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      tmp1_masked, ctx.solver->mkBVAnd(tmp1, ctx.solver->mkBVFromDec(255, 32))));
   auto tmp2 = ctx.solver->mkSymbol("tmp2", ctx.solver->mkBVSort(32));
-  ctx.solver->addConstraint(
-      ctx.solver->mkEqual(tmp2, ctx.solver->mkBVSub(tmp1, ctx.shift)));
-
-  // lsl.w r3, r1, r3 (ARM uses bottom 8 bits; if >= 32, result is 0)
-  auto tmp2_masked = ctx.solver->mkSymbol("tmp2_masked", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
-      tmp2_masked, ctx.solver->mkBVAnd(tmp2, ctx.solver->mkBVFromDec(255, 32))));
-  auto tmp3 = ctx.solver->mkSymbol("tmp3", ctx.solver->mkBVSort(32));
-  ctx.solver->addConstraint(ctx.solver->mkEqual(
-      tmp3, ctx.solver->mkIte(
-          ctx.solver->mkBVUge(tmp2_masked, ctx.solver->mkBVFromDec(32, 32)),
+      tmp2, ctx.solver->mkIte(
+          ctx.solver->mkBVUge(tmp1_masked, ctx.solver->mkBVFromDec(32, 32)),
           ctx.solver->mkBVFromDec(0, 32),
-          ctx.solver->mkBVShl(ctx.lhsHi, tmp2_masked))));
+          ctx.solver->mkBVShl(ctx.lhsHi, tmp1_masked))));
 
   // m_jit.or32(tmp, resultLo);
   auto resultLo2 = ctx.solver->mkSymbol("resultLo2", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(
-      ctx.solver->mkEqual(resultLo2, ctx.solver->mkBVOr(tmp3, resultLo1)));
+      ctx.solver->mkEqual(resultLo2, ctx.solver->mkBVOr(tmp2, resultLo1)));
 
-  // subw r3, r2, #0x20  (r3 = r2 - 0x20, which is shift - 32)
+  // m_jit.sub32(shift, TrustedImm32(32), tmp);
+  auto tmp3 = ctx.solver->mkSymbol("tmp3", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      tmp3, ctx.solver->mkBVSub(ctx.shift, ctx.solver->mkBVFromDec(32, 32))));
+
+  // m_jit.rshiftUnchecked(lhsHi, tmp, tmp);
+  // ARM uses bottom 8 bits; if >= 32, result is sign-extended
+  auto tmp3_masked = ctx.solver->mkSymbol("tmp3_masked", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      tmp3_masked, ctx.solver->mkBVAnd(tmp3, ctx.solver->mkBVFromDec(255, 32))));
   auto tmp4 = ctx.solver->mkSymbol("tmp4", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
-      tmp4, ctx.solver->mkBVSub(ctx.shift, ctx.solver->mkBVFromDec(32, 32))));
-
-  // asr.w r3, r1, r3 (ARM uses bottom 8 bits; if >= 32, result is sign-extended)
-  auto tmp4_masked = ctx.solver->mkSymbol("tmp4_masked", ctx.solver->mkBVSort(32));
-  ctx.solver->addConstraint(ctx.solver->mkEqual(
-      tmp4_masked, ctx.solver->mkBVAnd(tmp4, ctx.solver->mkBVFromDec(255, 32))));
-  auto tmp5 = ctx.solver->mkSymbol("tmp5", ctx.solver->mkBVSort(32));
-  ctx.solver->addConstraint(ctx.solver->mkEqual(
-      tmp5, ctx.solver->mkIte(
-          ctx.solver->mkBVUge(tmp4_masked, ctx.solver->mkBVFromDec(32, 32)),
+      tmp4, ctx.solver->mkIte(
+          ctx.solver->mkBVUge(tmp3_masked, ctx.solver->mkBVFromDec(32, 32)),
           ctx.solver->mkBVAshr(ctx.lhsHi, ctx.solver->mkBVFromDec(31, 32)),
-          ctx.solver->mkBVAshr(ctx.lhsHi, tmp4_masked))));
+          ctx.solver->mkBVAshr(ctx.lhsHi, tmp3_masked))));
 
-  // orrs r3, r0  (r3 |= r0)
-  auto tmp6 = ctx.solver->mkSymbol("tmp6", ctx.solver->mkBVSort(32));
+  // m_jit.or32(tmp, resultLo, tmp);
+  auto tmp5 = ctx.solver->mkSymbol("tmp5", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(
-      ctx.solver->mkEqual(tmp6, ctx.solver->mkBVOr(tmp5, resultLo2)));
+      ctx.solver->mkEqual(tmp5, ctx.solver->mkBVOr(tmp4, resultLo2)));
 
-  // cmp r2, #0x20; ite hs; movhs r0, r3
-  // if (shift >= 32) then resultLo = tmp6 else resultLo = resultLo2
+  // m_jit.compare32(shift, TrustedImm32(32), RelationalCondition::GreaterThanOrEqual);
+  // m_jit.moveConditionally32(resultLo, tmp);
   auto condition =
       ctx.solver->mkBVUge(ctx.shift, ctx.solver->mkBVFromDec(32, 32));
   auto resultLo_final =
       ctx.solver->mkSymbol("resultLo_final", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
-      resultLo_final, ctx.solver->mkIte(condition, tmp6, resultLo2)));
+      resultLo_final, ctx.solver->mkIte(condition, tmp5, resultLo2)));
 
-  // asr.w r1, r1, r2
+  // m_jit.rshiftUnchecked(lhsHi, shift, resultHi);
   auto resultHi_final =
       ctx.solver->mkSymbol("resultHi_final", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
@@ -140,22 +137,23 @@ camada::SMTExprRef computeActualRightShiftArithmetic(const ShiftContext &ctx) {
 }
 
 camada::SMTExprRef computeActualRightShiftLogical(const ShiftContext &ctx) {
-  // and r4, r0, #0x3f
+  // m_jit.and32(TrustedImm32(63), shiftReg, shift);
   auto shift_computed =
       ctx.solver->mkBVAnd(ctx.solver->mkBVFromDec(63, 32), ctx.rhsLo);
   ctx.solver->addConstraint(ctx.solver->mkEqual(ctx.shift, shift_computed));
 
-  // lsr.w r0, r2, r4
+  // m_jit.urshiftUnchecked(lhsLo, shift, resultLo);
   auto resultLo1 = ctx.solver->mkSymbol("resultLo1", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
       resultLo1, ctx.solver->mkBVLshr(ctx.lhsLo, ctx.shift)));
 
-  // rsb.w r8, r4, #0x20  (r8 = 32 - shift)
+  // m_jit.sub32(TrustedImm32(32), shift, tmp);
   auto tmp1 = ctx.solver->mkSymbol("tmp1", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
       tmp1, ctx.solver->mkBVSub(ctx.solver->mkBVFromDec(32, 32), ctx.shift)));
 
-  // lsl.w r8, r3, r8 (ARM uses bottom 8 bits; if >= 32, result is 0)
+  // m_jit.lshiftUnchecked(lhsHi, tmp, tmp);
+  // ARM uses bottom 8 bits; if >= 32, result is 0
   auto tmp1_masked = ctx.solver->mkSymbol("tmp1_masked", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
       tmp1_masked, ctx.solver->mkBVAnd(tmp1, ctx.solver->mkBVFromDec(255, 32))));
@@ -166,17 +164,18 @@ camada::SMTExprRef computeActualRightShiftLogical(const ShiftContext &ctx) {
           ctx.solver->mkBVFromDec(0, 32),
           ctx.solver->mkBVShl(ctx.lhsHi, tmp1_masked))));
 
-  // orr.w r0, r0, r8
+  // m_jit.or32(tmp, resultLo);
   auto resultLo2 = ctx.solver->mkSymbol("resultLo2", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(
       ctx.solver->mkEqual(resultLo2, ctx.solver->mkBVOr(tmp2, resultLo1)));
 
-  // subw r8, r4, #0x20  (r8 = shift - 32)
+  // m_jit.sub32(shift, TrustedImm32(32), tmp);
   auto tmp3 = ctx.solver->mkSymbol("tmp3", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
       tmp3, ctx.solver->mkBVSub(ctx.shift, ctx.solver->mkBVFromDec(32, 32))));
 
-  // lsr.w r8, r3, r8 (ARM uses bottom 8 bits; if >= 32, result is 0)
+  // m_jit.urshiftUnchecked(lhsHi, tmp, tmp);
+  // ARM uses bottom 8 bits; if >= 32, result is 0
   auto tmp3_masked = ctx.solver->mkSymbol("tmp3_masked", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
       tmp3_masked, ctx.solver->mkBVAnd(tmp3, ctx.solver->mkBVFromDec(255, 32))));
@@ -187,13 +186,13 @@ camada::SMTExprRef computeActualRightShiftLogical(const ShiftContext &ctx) {
           ctx.solver->mkBVFromDec(0, 32),
           ctx.solver->mkBVLshr(ctx.lhsHi, tmp3_masked))));
 
-  // orr.w r0, r0, r8
+  // m_jit.or32(tmp, resultLo);
   auto resultLo_final =
       ctx.solver->mkSymbol("resultLo_final", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(
       resultLo_final, ctx.solver->mkBVOr(tmp4, resultLo2)));
 
-  // lsr.w r1, r3, r4
+  // m_jit.urshiftUnchecked(lhsHi, shift, resultHi);
   auto resultHi_final =
       ctx.solver->mkSymbol("resultHi_final", ctx.solver->mkBVSort(32));
   ctx.solver->addConstraint(ctx.solver->mkEqual(

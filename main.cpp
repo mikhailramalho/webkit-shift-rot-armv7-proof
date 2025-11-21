@@ -11,7 +11,7 @@
 
 #define REQUIRE assert
 
-enum class ShiftOp { LEFT_SHIFT, RIGHT_SHIFT_LOGICAL, RIGHT_SHIFT_ARITHMETIC };
+enum class ShiftOp { LEFT_SHIFT, RIGHT_SHIFT_LOGICAL, RIGHT_SHIFT_ARITHMETIC, ROTATE_LEFT };
 
 struct ShiftContext {
   camada::SMTSolverRef solver;
@@ -52,6 +52,13 @@ camada::SMTExprRef computeExpected(const ShiftContext &ctx, ShiftOp op) {
   case ShiftOp::RIGHT_SHIFT_ARITHMETIC:
     ctx.solver->addConstraint(
         ctx.solver->mkEqual(expected64, ctx.solver->mkBVAshr(lhs64, shift64)));
+    break;
+  case ShiftOp::ROTATE_LEFT:
+    ctx.solver->addConstraint(ctx.solver->mkEqual(
+        expected64,
+        ctx.solver->mkBVOr(ctx.solver->mkBVShl(lhs64, shift64),
+                           ctx.solver->mkBVLshr(lhs64, ctx.solver->mkBVSub(
+                               ctx.solver->mkBVFromDec(64, 64), shift64)))));
     break;
   }
 
@@ -262,6 +269,89 @@ camada::SMTExprRef computeActualLeftShift(const ShiftContext &ctx) {
   return actual64;
 }
 
+camada::SMTExprRef computeActualRotateLeft(const ShiftContext &ctx) {
+  // Test/swap bit 5
+  // leftShift = amount & 31
+  // rightShift = 32 - leftShift
+  // resultLo = (scratch0 << leftShift) | (scratch1 >> rightShift)
+  // resultHi = (scratch1 << leftShift) | (scratch0 >> rightShift)
+
+  // m_assembler.tst(shiftAmount, ARMThumbImmediate::makeEncodedImm(32));
+  auto bit5_set = ctx.solver->mkNot(ctx.solver->mkEqual(
+      ctx.solver->mkBVAnd(ctx.rhsLo, ctx.solver->mkBVFromDec(32, 32)),
+      ctx.solver->mkBVFromDec(0, 32)));
+
+  // m_assembler.mov(scratch0, srcLo);
+  // m_assembler.mov(scratch1, srcHi);
+  // If bit 5 is set, swap them:
+  // m_assembler.it(ARMv7Assembler::ConditionNE, true);
+  // m_assembler.mov(scratch0, srcHi);
+  // m_assembler.mov(scratch1, srcLo);
+  auto scratch0 = ctx.solver->mkSymbol("scratch0", ctx.solver->mkBVSort(32));
+  auto scratch1 = ctx.solver->mkSymbol("scratch1", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      scratch0, ctx.solver->mkIte(bit5_set, ctx.lhsHi, ctx.lhsLo)));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      scratch1, ctx.solver->mkIte(bit5_set, ctx.lhsLo, ctx.lhsHi)));
+
+  // m_jit.and32(TrustedImm32(31), shiftReg, leftShift);
+  auto leftShift = ctx.solver->mkSymbol("leftShift", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      leftShift, ctx.solver->mkBVAnd(ctx.rhsLo, ctx.solver->mkBVFromDec(31, 32))));
+
+  // m_jit.sub32(TrustedImm32(32), leftShift, rightShift);
+  auto rightShift = ctx.solver->mkSymbol("rightShift", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      rightShift, ctx.solver->mkBVSub(ctx.solver->mkBVFromDec(32, 32), leftShift)));
+
+  // m_jit.lshiftUnchecked(scratch0, leftShift, resultLo);
+  auto resultLo1 = ctx.solver->mkSymbol("resultLo1", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      resultLo1, ctx.solver->mkBVShl(scratch0, leftShift)));
+
+  // m_jit.urshiftUnchecked(scratch1, rightShift, tmp);
+  // ARM uses bottom 8 bits; if >= 32, result is 0
+  auto rightShift_masked = ctx.solver->mkSymbol("rightShift_masked", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      rightShift_masked, ctx.solver->mkBVAnd(rightShift, ctx.solver->mkBVFromDec(255, 32))));
+  auto tmp1 = ctx.solver->mkSymbol("tmp1", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      tmp1, ctx.solver->mkIte(
+          ctx.solver->mkBVUge(rightShift_masked, ctx.solver->mkBVFromDec(32, 32)),
+          ctx.solver->mkBVFromDec(0, 32),
+          ctx.solver->mkBVLshr(scratch1, rightShift_masked))));
+
+  // m_jit.or32(tmp, resultLo);
+  auto resultLo_final = ctx.solver->mkSymbol("resultLo_final", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      resultLo_final, ctx.solver->mkBVOr(resultLo1, tmp1)));
+
+  // m_jit.lshiftUnchecked(scratch1, leftShift, resultHi);
+  auto resultHi1 = ctx.solver->mkSymbol("resultHi1", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      resultHi1, ctx.solver->mkBVShl(scratch1, leftShift)));
+
+  // m_jit.urshiftUnchecked(scratch0, rightShift, tmp);
+  auto tmp2 = ctx.solver->mkSymbol("tmp2", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      tmp2, ctx.solver->mkIte(
+          ctx.solver->mkBVUge(rightShift_masked, ctx.solver->mkBVFromDec(32, 32)),
+          ctx.solver->mkBVFromDec(0, 32),
+          ctx.solver->mkBVLshr(scratch0, rightShift_masked))));
+
+  // m_jit.or32(tmp, resultHi);
+  auto resultHi_final = ctx.solver->mkSymbol("resultHi_final", ctx.solver->mkBVSort(32));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      resultHi_final, ctx.solver->mkBVOr(resultHi1, tmp2)));
+
+  // Concatenate resultHi:resultLo to form the 64-bit result
+  auto actual64 = ctx.solver->mkSymbol("actual64", ctx.solver->mkBVSort(64));
+  ctx.solver->addConstraint(ctx.solver->mkEqual(
+      actual64, ctx.solver->mkBVConcat(resultHi_final, resultLo_final)));
+
+  return actual64;
+}
+
 void proveShiftCorrectness(const ShiftContext &ctx,
                            const std::string &algorithmName, ShiftOp op,
                            camada::SMTExprRef actual64) {
@@ -326,6 +416,9 @@ void testShift(const std::string &testName, ShiftOp op,
     break;
   case ShiftOp::RIGHT_SHIFT_ARITHMETIC:
     actualResult = computeActualRightShiftArithmetic(ctx);
+    break;
+  case ShiftOp::ROTATE_LEFT:
+    actualResult = computeActualRotateLeft(ctx);
     break;
   }
 
@@ -475,6 +568,47 @@ int main() {
     testShift("Logical Right Shift (rhs = result)",
               ShiftOp::RIGHT_SHIFT_LOGICAL, lhsHi, lhsLo, rhsHi, rhsLo, rhsHi,
               rhsLo, solver,
+              /*checkLhsPreserved=*/true, /*checkRhsPreserved=*/false);
+  }
+
+  // Test 10-12: Rotate left tests
+  // Test 10: No aliasing
+  {
+    auto solver = camada::createZ3Solver();
+    auto lhsLo = solver->mkSymbol("lhsLo", solver->mkBVSort(32));
+    auto lhsHi = solver->mkSymbol("lhsHi", solver->mkBVSort(32));
+    auto rhsLo = solver->mkSymbol("rhsLo", solver->mkBVSort(32));
+    auto rhsHi = solver->mkSymbol("rhsHi", solver->mkBVSort(32));
+    auto resultLo = solver->mkSymbol("resultLo", solver->mkBVSort(32));
+    auto resultHi = solver->mkSymbol("resultHi", solver->mkBVSort(32));
+
+    testShift("Rotate Left (no aliasing)", ShiftOp::ROTATE_LEFT, lhsHi, lhsLo,
+              rhsHi, rhsLo, resultHi, resultLo, solver);
+  }
+
+  // Test 11: lhs and result share same symbols
+  {
+    auto solver = camada::createZ3Solver();
+    auto lhsLo = solver->mkSymbol("lhsLo", solver->mkBVSort(32));
+    auto lhsHi = solver->mkSymbol("lhsHi", solver->mkBVSort(32));
+    auto rhsLo = solver->mkSymbol("rhsLo", solver->mkBVSort(32));
+    auto rhsHi = solver->mkSymbol("rhsHi", solver->mkBVSort(32));
+
+    testShift("Rotate Left (lhs = result)", ShiftOp::ROTATE_LEFT, lhsHi, lhsLo,
+              rhsHi, rhsLo, lhsHi, lhsLo, solver,
+              /*checkLhsPreserved=*/false, /*checkRhsPreserved=*/true);
+  }
+
+  // Test 12: rhs and result share same symbols
+  {
+    auto solver = camada::createZ3Solver();
+    auto lhsLo = solver->mkSymbol("lhsLo", solver->mkBVSort(32));
+    auto lhsHi = solver->mkSymbol("lhsHi", solver->mkBVSort(32));
+    auto rhsLo = solver->mkSymbol("rhsLo", solver->mkBVSort(32));
+    auto rhsHi = solver->mkSymbol("rhsHi", solver->mkBVSort(32));
+
+    testShift("Rotate Left (rhs = result)", ShiftOp::ROTATE_LEFT, lhsHi, lhsLo,
+              rhsHi, rhsLo, rhsHi, rhsLo, solver,
               /*checkLhsPreserved=*/true, /*checkRhsPreserved=*/false);
   }
 }
